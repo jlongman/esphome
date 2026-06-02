@@ -27,6 +27,7 @@ struct Sample {
   uint8_t temperature{0};
   uint8_t referenceTemperature{0};
   float measurement{NAN};
+  bool published_live{false};
 };
 
 class WiiBalanceBoard : public Component {

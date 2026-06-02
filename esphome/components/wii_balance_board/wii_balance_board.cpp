@@ -61,6 +61,7 @@ void WiiBalanceBoard::board_disconnected(uint16_t handle) {
       battery_level_->publish_state(sample.battery);
     }
     if (!isnan(sample.measurement)) {
+      ESP_LOGI(TAG, "Publishing final weight %.1f kg", sample.measurement);
       weight_->publish_state(sample.measurement);
     }
     sampleMap.erase(handle);
@@ -102,6 +103,12 @@ void WiiBalanceBoard::board_sample(uint16_t handle, uint8_t battery, uint8_t ref
     return;
   }
 
+  if (!sample.published_live) {
+    ESP_LOGI(TAG, "Publishing live weight %.1f kg", adjusted);
+    weight_->publish_state(adjusted);
+    sample.published_live = true;
+  }
+
   int size = 64;
   sample.samples[sample.sample_count] = adjusted;
   sample.sample_count = (sample.sample_count + 1) % size;
@@ -128,6 +135,8 @@ void WiiBalanceBoard::board_sample(uint16_t handle, uint8_t battery, uint8_t ref
 
     if (mean > 10 && deviation < std_dev_) {  // Ignore all means below 10kg.
       sample.measurement = mean;
+      ESP_LOGI(TAG, "Publishing stable weight %.1f kg", sample.measurement);
+      weight_->publish_state(sample.measurement);
 
       // We have a valid sample, schedule board disconnect.
       ESP_LOGD(TAG, "Sample valid, disconnecting");
