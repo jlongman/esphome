@@ -25,6 +25,43 @@ static const char *TAG = "bluetooth";
 // controller directly through VHCI, so no normal Arduino BT library marks it in use.
 extern "C" bool btInUse(void) { return true; }
 
+static bool start_classic_bt_controller() {
+  auto status = esp_bt_controller_get_status();
+  ESP_LOGD(TAG, "BT controller status before start: %d", status);
+
+  if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    return true;
+  }
+
+  esp_err_t err;
+  if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+#if CONFIG_IDF_TARGET_ESP32
+    cfg.mode = ESP_BT_MODE_CLASSIC_BT;
+#endif
+    ESP_LOGD(TAG, "Initializing BT controller in Classic mode");
+    err = esp_bt_controller_init(&cfg);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
+      return false;
+    }
+  }
+
+  status = esp_bt_controller_get_status();
+  ESP_LOGD(TAG, "BT controller status after init: %d", status);
+  if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+    ESP_LOGD(TAG, "Enabling BT controller in Classic mode");
+    err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_bt_controller_enable(CLASSIC) failed: %s", esp_err_to_name(err));
+      return false;
+    }
+  }
+
+  status = esp_bt_controller_get_status();
+  ESP_LOGD(TAG, "BT controller status after enable: %d", status);
+  return status == ESP_BT_CONTROLLER_STATUS_ENABLED;
+}
 
 static_assert(CONFIG_BT_ENABLED && CONFIG_BLUEDROID_ENABLED,
               "Bluetooth is not enabled! Please run `make menuconfig` to and enable it");
@@ -777,7 +814,7 @@ void Bluetooth::begin() {
   }
 
   ESP_LOGI(TAG, "Starting Bluetooth controller");
-  if (!btStartMode(BT_MODE_CLASSIC_BT)) {
+  if (!start_classic_bt_controller()) {
     ESP_LOGE(TAG, "Failed to initialize Bluetooth Classic controller");
     return;
   }
