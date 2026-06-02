@@ -20,6 +20,12 @@
 
 static const char *TAG = "bluetooth";
 
+// Arduino-ESP32 releases Bluetooth controller memory during initArduino() unless a
+// strong btInUse() symbol says Bluetooth will be used. This component drives the
+// controller directly through VHCI, so no normal Arduino BT library marks it in use.
+extern "C" bool btInUse(void) { return true; }
+
+
 static_assert(CONFIG_BT_ENABLED && CONFIG_BLUEDROID_ENABLED,
               "Bluetooth is not enabled! Please run `make menuconfig` to and enable it");
 static_assert(CONFIG_CLASSIC_BT_ENABLED, "Board does not support Bluetooth BR/EDR");
@@ -771,8 +777,8 @@ void Bluetooth::begin() {
   }
 
   ESP_LOGI(TAG, "Starting Bluetooth controller");
-  if (!btStart()) {
-    ESP_LOGE(TAG, "Failed to initialize Bluetooth controller");
+  if (!btStartMode(BT_MODE_CLASSIC_BT)) {
+    ESP_LOGE(TAG, "Failed to initialize Bluetooth Classic controller");
     return;
   }
 
