@@ -211,6 +211,7 @@ float WiiBalanceBoard::get_setup_priority() const { return setup_priority::AFTER
 void WiiBalanceBoard::sync(bool enable) {
   ESP_LOGI(TAG, enable ? "Starting scan" : "Stopping scan");
   if (!bluetooth_ready_) {
+    bluetooth.begin();
     if (enable) {
       ESP_LOGI(TAG, "Bluetooth not initialized yet; scan will start when Bluetooth is ready");
       sync_on_ready_ = true;

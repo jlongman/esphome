@@ -123,7 +123,7 @@ struct Bluetooth::Impl {
   void step() {
     while (esp_vhci_host_check_send_available()) {
       if (auto txData = txBuffer.read(0)) {
-        // ESP_LOGD(TAG, "TX>: %s", formatHex(txData.data(), txData.size()));
+        ESP_LOGVV(TAG, "TX %u: %s", (unsigned) txData.size(), formatHex(txData.data(), txData.size()));
         esp_vhci_host_send_packet(txData.data(), txData.size());
       } else {
         break;
@@ -131,6 +131,7 @@ struct Bluetooth::Impl {
     }
 
     if (auto rxData = rxBuffer.read(0)) {
+      ESP_LOGVV(TAG, "RX %u: %s", (unsigned) rxData.size(), formatHex(rxData.data(), rxData.size()));
       const char *type;
       uint8_t typeColor;
       switch (rxData[0]) {
@@ -174,14 +175,23 @@ struct Bluetooth::Impl {
 
   // HCI
   void handleHCICommandComplete(uint8_t *data, size_t len) {
+    if (len < 4) {
+      ESP_LOGW(TAG, "Short HCI command complete event len=%u", (unsigned) len);
+      return;
+    }
+    ESP_LOGD(TAG, "HCI command complete opcode=0x%02X%02X status=0x%02X len=%u", data[2], data[1], data[3],
+             (unsigned) len);
+
     if (data[1] == 0x03 && data[2] == 0x0C) {  // reset
       if (data[3] == 0x00) {
+        ESP_LOGD(TAG, "HCI reset complete; reading Bluetooth address");
         CHECK_RESULT(enqueue_cmd_read_bd_addr(txBuffer));
       } else {
         ESP_LOGE(TAG, "Reset failed");
       }
     } else if (data[1] == 0x09 && data[2] == 0x10) {  // read_bd_addr
       if (data[3] == 0x00) {                          // OK
+        ESP_LOGD(TAG, "Bluetooth address read; writing local name");
         char name[] = "ESP32-BT-WIIP";
         CHECK_RESULT(enqueue_cmd_write_local_name(txBuffer, (uint8_t *) name, sizeof(name)));
       } else {
@@ -189,6 +199,7 @@ struct Bluetooth::Impl {
       }
     } else if (data[1] == 0x13 && data[2] == 0x0C) {  // write_local_name
       if (data[3] == 0x00) {                          // OK
+        ESP_LOGD(TAG, "Local name written; writing class of device");
         uint8_t cod[3] = {0x04, 0x05, 0x00};
         CHECK_RESULT(enqueue_cmd_write_class_of_device(txBuffer, cod));
       } else {
@@ -196,12 +207,14 @@ struct Bluetooth::Impl {
       }
     } else if (data[1] == 0x24 && data[2] == 0x0C) {  // write_class_of_device
       if (data[3] == 0x00) {                          // OK
+        ESP_LOGD(TAG, "Class of device written; enabling page/inquiry scan");
         CHECK_RESULT(enqueue_cmd_write_scan_enable(txBuffer, 3));
       } else {
         ESP_LOGE(TAG, "write_class_of_device failed.");
       }
     } else if (data[1] == 0x1A && data[2] == 0x0C) {  // write_scan_enable
       if (data[3] == 0x00) {                          // OK
+        ESP_LOGD(TAG, "Scan enable written; Bluetooth HCI initialization complete");
         initialized = true;
         if (readyListener) {
           readyListener(bluetooth);
@@ -213,7 +226,11 @@ struct Bluetooth::Impl {
   }
 
   void handleHCICommandStatusEvent(uint8_t *data, size_t len) {
-    if (data[2] == 0x01 && data[3] == 0x04) {
+    if (len >= 4) {
+      ESP_LOGD(TAG, "HCI command status opcode=0x%02X%02X status=0x%02X len=%u", data[3], data[2], data[0],
+               (unsigned) len);
+    }
+    if (len >= 4 && data[2] == 0x01 && data[3] == 0x04) {
       if (data[0] == 0x00) {
         hciListener(bluetooth, HCIInquiryStarted{});
       } else {
@@ -369,7 +386,10 @@ struct Bluetooth::Impl {
     }
   }
 
-  void sendHCIReset() { CHECK_RESULT(enqueue_cmd_reset(txBuffer)); }
+  void sendHCIReset() {
+    ESP_LOGD(TAG, "Queueing HCI reset");
+    CHECK_RESULT(enqueue_cmd_reset(txBuffer));
+  }
 
   void sendHCIDisconnect(uint16_t handle) { CHECK_RESULT(enqueue_cmd_disconnect(txBuffer, handle)); }
 
@@ -381,6 +401,7 @@ struct Bluetooth::Impl {
 
     uint8_t timeout = 0x10;  // Sync for 20.48 seconds (0x10 * 1.28s)
 
+    ESP_LOGD(TAG, "Queueing HCI inquiry");
     CHECK_RESULT(enqueue_cmd_inquiry(txBuffer, 0x9E8B33, timeout, 0x00));
   }
 
@@ -390,6 +411,7 @@ struct Bluetooth::Impl {
       return;
     }
 
+    ESP_LOGD(TAG, "Queueing HCI inquiry cancel");
     CHECK_RESULT(enqueue_cmd_inquiry_cancel(txBuffer));
   }
 
@@ -737,8 +759,13 @@ Bluetooth::~Bluetooth() { ESP_LOGD(TAG, "Shut down"); }
 
 void Bluetooth::begin() {
   if (m_impl->started) {
-    if (m_impl->initialized && m_impl->readyListener) {
-      m_impl->readyListener(this);
+    if (m_impl->initialized) {
+      if (m_impl->readyListener) {
+        m_impl->readyListener(this);
+      }
+    } else {
+      ESP_LOGW(TAG, "Bluetooth controller started but HCI is not initialized; retrying HCI reset");
+      m_impl->sendHCIReset();
     }
     return;
   }
@@ -765,6 +792,7 @@ void Bluetooth::begin() {
     return;
   }
 
+  ESP_LOGD(TAG, "VHCI callback registered; starting HCI initialization");
   m_impl->started = true;
   m_impl->sendHCIReset();
 }
