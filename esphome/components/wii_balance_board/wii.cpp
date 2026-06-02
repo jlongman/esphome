@@ -212,18 +212,22 @@ Wii::Wii(Bluetooth *bt) : bluetooth(bt) {
     std::visit(overloaded{
                    [this](const HCIInquiryStarted &) { this->eventListener(ScanStarted{}); },
                    [this](const HCIInquiryComplete &) { this->eventListener(ScanStopped{}); },
-                   [bt](const HCIInquiryResult &result) {
-                     if (result.classOfDevice == 0x042500) {
-                       bt->requestRemoteName(result);
-                     }
-                   },
-                   [this, bt](const HCIRemoteName &result) {
-                     log_i("Found %s %s", result.remoteName.data(), formatHex((uint8_t *) &result.inquiry.bdaddr, 6));
-                     if (result.remoteName == "Nintendo RVL-WBC-01") {
-                       this->set_paired_board(result.inquiry.bdaddr);
-                       bt->connect(result.inquiry);
-                     }
-                   },
+                    [this, bt](const HCIInquiryResult &result) {
+                      if (result.classOfDevice == 0x042500) {
+                        log_i("Found Wii balance board candidate %s", formatHex((uint8_t *) &result.bdaddr, 6));
+                        this->set_paired_board(result.bdaddr);
+                        bt->scan(false);
+                        bt->connect(result);
+                      }
+                    },
+                    [this, bt](const HCIRemoteName &result) {
+                      log_i("Found %s %s", result.remoteName.data(), formatHex((uint8_t *) &result.inquiry.bdaddr, 6));
+                      if (result.remoteName == "Nintendo RVL-WBC-01") {
+                        this->set_paired_board(result.inquiry.bdaddr);
+                        bt->scan(false);
+                        bt->connect(result.inquiry);
+                      }
+                    },
                    [bt](const HCIConnectionFailed &result) {
                      log_e("Failed to connect Wiimote %s reason=%02X", formatHex((uint8_t *) &result.bdaddr, 6),
                            result.reason);
