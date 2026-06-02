@@ -5,12 +5,20 @@
 #include "esphome/components/sensor/sensor.h"
 #include "wii.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/core/preferences.h"
 
 #include "task_queue.h"
 #include <unordered_map>
 
 namespace esphome {
 namespace wii_balance_board {
+
+struct PairedBoardPreference {
+  uint32_t magic{0};
+  uint64_t bdaddr{0};
+  bool hasLinkKey{false};
+  uint8_t linkKeyData[16]{};
+};
 
 struct Sample {
   float samples[64] = {NAN};
@@ -27,6 +35,7 @@ class WiiBalanceBoard : public Component {
 
   void setup() override;
   void loop() override;
+  float get_setup_priority() const override;
   void dump_config() override;
   void sync(bool enable);
 
@@ -41,6 +50,7 @@ class WiiBalanceBoard : public Component {
  protected:
   void board_connected(uint16_t handle);
   void board_disconnected(uint16_t handle);
+  void board_paired(uint64_t bdaddr, bool has_link_key, const uint8_t *link_key_data);
   void board_sample(uint16_t handle, uint8_t battery, uint8_t reference_temp, uint8_t temperature, float topRightLoad,
                     float bottomRightLoad, float topLeftLoad, float bottomLeftLoad);
 
@@ -48,9 +58,12 @@ class WiiBalanceBoard : public Component {
   detail::Wii wii;
   std::unordered_map<uint16_t, Sample> sampleMap;
   detail::TaskQueue queue;
+  ESPPreferenceObject paired_board_pref_;
 
   float std_dev_;
   int led_pin_;
+  bool bluetooth_ready_{false};
+  bool sync_on_ready_{false};
 
   sensor::Sensor *temperature_sensor_{nullptr};
   sensor::Sensor *reference_temperature_sensor_{nullptr};

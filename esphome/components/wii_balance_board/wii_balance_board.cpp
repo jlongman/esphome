@@ -2,14 +2,18 @@
 #include "wii_balance_board.h"
 
 #include "esphome/core/application.h"
+#include "esphome/core/preferences.h"
 
 #include <numeric>
+#include <cstring>
 #include "utils.h"
+#include "log.h"
 
 namespace esphome {
 namespace wii_balance_board {
 
 static const char *TAG = "wii_balance_board.component";
+static constexpr uint32_t PAIRED_BOARD_PREF_MAGIC = 0x57424301;
 
 uint8_t interpret_battery_level(uint8_t batteryLevel) {
   if (batteryLevel >= 0x8d) {
@@ -48,6 +52,7 @@ void WiiBalanceBoard::board_connected(uint16_t handle) {
 
 void WiiBalanceBoard::board_disconnected(uint16_t handle) {
   ESP_LOGI(TAG, "Board disconnected, uploaded sampled data.");
+  queue.cancel(handle);
   if (sampleMap.count(handle) > 0) {
     auto &sample = sampleMap[handle];
     if (sample.referenceTemperature > 0) {
@@ -59,6 +64,20 @@ void WiiBalanceBoard::board_disconnected(uint16_t handle) {
       weight_->publish_state(sample.measurement);
     }
     sampleMap.erase(handle);
+  }
+}
+
+void WiiBalanceBoard::board_paired(uint64_t bdaddr, bool has_link_key, const uint8_t *link_key_data) {
+  PairedBoardPreference pref{.magic = PAIRED_BOARD_PREF_MAGIC, .bdaddr = bdaddr, .hasLinkKey = has_link_key};
+  if (has_link_key && link_key_data != nullptr) {
+    memcpy(pref.linkKeyData, link_key_data, sizeof(pref.linkKeyData));
+  }
+
+  if (paired_board_pref_.save(&pref)) {
+    ESP_LOGI(TAG, "Saved balance board %s%s", formatHex((uint8_t *) &bdaddr, 6), has_link_key ? " link key" : " address");
+    global_preferences->sync();
+  } else {
+    ESP_LOGW(TAG, "Failed to save balance board pairing data");
   }
 }
 
@@ -118,11 +137,32 @@ void WiiBalanceBoard::board_sample(uint16_t handle, uint8_t battery, uint8_t ref
 }
 
 void WiiBalanceBoard::setup() {
+  paired_board_pref_ = global_preferences->make_preference<PairedBoardPreference>(
+      fnv1a_hash("wii_balance_board_paired_board"), true);
+
+  PairedBoardPreference pref;
+  if (paired_board_pref_.load(&pref) && pref.magic == PAIRED_BOARD_PREF_MAGIC && pref.bdaddr != 0) {
+    ESP_LOGI(TAG, "Loaded saved balance board %s%s", formatHex((uint8_t *) &pref.bdaddr, 6),
+             pref.hasLinkKey ? " with link key" : "");
+    if (pref.hasLinkKey) {
+      wii.set_link_key(pref.bdaddr, pref.linkKeyData);
+    } else {
+      wii.set_paired_board(pref.bdaddr);
+    }
+  }
+
   if (led_pin_ >= 0) {
     pinMode(led_pin_, OUTPUT);
     digitalWrite(led_pin_, HIGH);
   }
-  bluetooth.onReady([](auto) { ESP_LOGI(TAG, "Bluetooth initialized"); });
+  bluetooth.onReady([this](auto) {
+    ESP_LOGI(TAG, "Bluetooth initialized");
+    this->bluetooth_ready_ = true;
+    if (this->sync_on_ready_) {
+      this->sync_on_ready_ = false;
+      this->sync(true);
+    }
+  });
 
   wii.onEvent([this](const detail::WiiEvent &event) {
     std::visit(overloaded{
@@ -147,6 +187,9 @@ void WiiBalanceBoard::setup() {
                      this->board_connected(board.handle);
                    },
                    [this](const detail::BalanceBoardDisconnected &board) { this->board_disconnected(board.handle); },
+                   [this](const detail::BalanceBoardPaired &board) {
+                     this->board_paired(board.bdaddr, board.hasLinkKey, board.linkKeyData);
+                   },
                    [this](const detail::BalanceBoardData &data) {
                      this->board_sample(data.handle, interpret_battery_level(data.batteryLevel),
                                         data.referenceTemperature, data.temperature, data.tr, data.br, data.tl,
@@ -162,8 +205,19 @@ void WiiBalanceBoard::loop() {
   queue.process(millis());
 }
 
+float WiiBalanceBoard::get_setup_priority() const { return setup_priority::AFTER_BLUETOOTH; }
+
 void WiiBalanceBoard::sync(bool enable) {
   ESP_LOGI(TAG, enable ? "Starting scan" : "Stopping scan");
+  if (!bluetooth_ready_) {
+    if (enable) {
+      ESP_LOGI(TAG, "Bluetooth not initialized yet; scan will start when Bluetooth is ready");
+      sync_on_ready_ = true;
+    } else {
+      sync_on_ready_ = false;
+    }
+    return;
+  }
   wii.sync(enable);
 }
 

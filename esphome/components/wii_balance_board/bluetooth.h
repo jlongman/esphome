@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include <algorithm>
 #include <memory>
 #include <variant>
@@ -49,9 +51,12 @@ struct HCIConnectionRequest {
 
 struct HCILinkKeyRequest {
   uint64_t bdaddr;
+};
+
+struct HCILinkKeyNotification {
+  uint64_t bdaddr;
   uint8_t keyType;
-  uint8_t *linkKeyData;
-  size_t size;
+  uint8_t linkKeyData[16];
 };
 
 struct HCIPINRequest {
@@ -90,7 +95,8 @@ struct ACLData {
 };
 
 using HCIEvent = std::variant<HCIInquiryStarted, HCIInquiryComplete, HCIInquiryResult, HCIConnectionEstablished,
-                              HCIConnectionFailed, HCIDisconnected, HCIRemoteName, HCILinkKeyRequest, HCIPINRequest>;
+                              HCIConnectionFailed, HCIDisconnected, HCIRemoteName, HCILinkKeyRequest,
+                              HCILinkKeyNotification, HCIPINRequest>;
 using ACLEvent = std::variant<ACLDisconnected, ACLConnectionFailed, ACLConnectionEstablished, ACLData>;
 
 class Bluetooth {
@@ -115,6 +121,7 @@ class Bluetooth {
   void requestRemoteName(const HCIInquiryResult &result);
   void connect(const HCIInquiryResult &result);
   void auth(uint16_t handle);
+  void sendLinkKeyReply(uint64_t bdaddr, const uint8_t *linkKeyData);
   void negativeReply(uint64_t bdaddr);
   void disconnect(uint16_t handle);
   void sendPinReply(uint64_t bdaddr, uint8_t *pinData, size_t len);

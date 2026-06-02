@@ -22,9 +22,11 @@
 #define HCI_REMOTE_NAME_REQUEST (0x0019 | HCI_GRP_LINK_CONT_CMDS)
 #define HCI_CREATE_CONNECTION (0x0005 | HCI_GRP_LINK_CONT_CMDS)
 #define HCI_AUTHENTICATION (0x0011 | HCI_GRP_LINK_CONT_CMDS)
+#define HCI_LINK_KEY_REPLY (0x000B | HCI_GRP_LINK_CONT_CMDS)
 #define HCI_NEGATIVE_REPLY (0x000C | HCI_GRP_LINK_CONT_CMDS)
 #define HCI_PIN_REPLY (0x000D | HCI_GRP_LINK_CONT_CMDS)
 #define HCI_ACCEPT_CONNECTION (0x0009 | HCI_GRP_LINK_CONT_CMDS)
+#define HCI_REJECT_CONNECTION (0x000A | HCI_GRP_LINK_CONT_CMDS)
 #define HCI_DISCONNECT (0x0006 | HCI_GRP_LINK_CONT_CMDS)
 
 #define BD_ADDR_LEN (6)
@@ -202,6 +204,21 @@ static bool enqueue_cmd_auth_request(RingBuffer &buffer, uint16_t connection_han
   return false;
 }
 
+
+static bool enqueue_cmd_link_key_reply(RingBuffer &buffer, uint64_t bdaddr, const uint8_t *link_key) {
+  if (auto out = buffer.allocate(HCI_H4_CMD_PREAMBLE_SIZE + 22)) {
+    uint8_t *buf = out.data();
+    UINT8_TO_STREAM(buf, H4_TYPE_COMMAND);
+    UINT16_TO_STREAM(buf, HCI_LINK_KEY_REPLY);
+    UINT8_TO_STREAM(buf, 6 + 16);
+
+    U64_ADDR_TO_STREAM(buf, bdaddr);
+    ARRAY_TO_STREAM(buf, link_key, 16);
+    return true;
+  }
+  return false;
+}
+
 static bool enqueue_cmd_negative_reply(RingBuffer &buffer, uint64_t bdaddr) {
   if (auto out = buffer.allocate(HCI_H4_CMD_PREAMBLE_SIZE + 6)) {
     uint8_t *buf = out.data();
@@ -257,7 +274,7 @@ static bool enqueue_cmd_reject_connection(RingBuffer &buffer, uint64_t bd_addr, 
     uint8_t *buf = out.data();
 
     UINT8_TO_STREAM(buf, H4_TYPE_COMMAND);
-    UINT16_TO_STREAM(buf, HCI_ACCEPT_CONNECTION);
+    UINT16_TO_STREAM(buf, HCI_REJECT_CONNECTION);
     UINT8_TO_STREAM(buf, 6 + 1);
     U64_ADDR_TO_STREAM(buf, bd_addr);
     UINT8_TO_STREAM(buf, rejReason);

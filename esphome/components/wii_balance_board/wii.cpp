@@ -217,38 +217,47 @@ Wii::Wii(Bluetooth *bt) : bluetooth(bt) {
                        bt->requestRemoteName(result);
                      }
                    },
-                   [bt](const HCIRemoteName &result) {
+                   [this, bt](const HCIRemoteName &result) {
                      log_i("Found %s %s", result.remoteName.data(), formatHex((uint8_t *) &result.inquiry.bdaddr, 6));
                      if (result.remoteName == "Nintendo RVL-WBC-01") {
+                       this->set_paired_board(result.inquiry.bdaddr);
                        bt->connect(result.inquiry);
                      }
                    },
                    [bt](const HCIConnectionFailed &result) {
-                     log_e("Failed to connect Wiimote %s", formatHex((uint8_t *) &result.bdaddr, 6));
+                     log_e("Failed to connect Wiimote %s reason=%02X", formatHex((uint8_t *) &result.bdaddr, 6),
+                           result.reason);
                    },
-                   [bt](const HCIConnectionEstablished &result) {
+                   [this, bt](const HCIConnectionEstablished &result) {
                      log_i("Wiimote connection %s, handle: %d", result.accepted ? "accepted" : "established",
                            result.handle);
 
                      if (result.accepted) {
-                       // We accepted a connection from an authenticated Wiimote.
-                       // Return early, as it will establish the L2 connections.
+                       // The board initiated reconnection; it will establish its own L2CAP channels.
+                       this->set_paired_board(result.bdaddr);
                        return;
                      }
 
-                     // Send auth request if pairing
-                     log_i("Initiating auth");
-                     bt->auth(result.handle);
-
-                     // Establish L2CAP connections
-                     // PSM: HID_Control=0x0011, HID_Interrupt=0x0013
-                     // MTU: 672
+                     // Match the known-good wiimote sequence: open HID Control first, then authenticate,
+                     // then open HID Interrupt once Control is configured.
                      bt->l2cap_connect(result.handle, 0x0011, 0x40);
-                     bt->l2cap_connect(result.handle, 0x0013, 0x40);
                    },
-                   [bt](const HCILinkKeyRequest &result) {
-                     log_i("Negative link reply");
-                     bt->negativeReply(result.bdaddr);
+                   [this, bt](const HCILinkKeyRequest &result) {
+                     uint8_t link_key[16];
+                     if (this->get_link_key(result.bdaddr, link_key)) {
+                       log_i("Sending stored link key");
+                       bt->sendLinkKeyReply(result.bdaddr, link_key);
+                     } else {
+                       log_i("No stored link key; asking board to pair with PIN");
+                       bt->negativeReply(result.bdaddr);
+                     }
+                   },
+                   [this](const HCILinkKeyNotification &result) {
+                     log_i("Stored link key for %s", formatHex((uint8_t *) &result.bdaddr, 6));
+                     this->set_link_key(result.bdaddr, result.linkKeyData);
+                     BalanceBoardPaired paired{.bdaddr = result.bdaddr, .hasLinkKey = true};
+                     memcpy(paired.linkKeyData, result.linkKeyData, sizeof(paired.linkKeyData));
+                     this->eventListener(paired);
                    },
                    [bt](const HCIPINRequest &result) {
                      uint8_t pin_data[6];
@@ -261,7 +270,13 @@ Wii::Wii(Bluetooth *bt) : bluetooth(bt) {
                      log_i("Sending pin reply");
                      bt->sendPinReply(result.bdaddr, pin_data, 6);
                    },
-                   [bt](const HCIDisconnected &result) { log_i("Disconnected %d", result.handle); },
+                   [this](const HCIDisconnected &result) {
+                     log_i("Disconnected %d", result.handle);
+                     if (connectedBoards.contains(result.handle)) {
+                       this->eventListener(BalanceBoardDisconnected{.handle = result.handle});
+                       connectedBoards.erase(result.handle);
+                     }
+                   },
                },
                event);
   });
@@ -283,13 +298,19 @@ Wii::Wii(Bluetooth *bt) : bluetooth(bt) {
                        bluetooth->disconnect(info.handle);
                      }
                    },
-                   [this](const ACLConnectionEstablished &conn) {
-                     if (conn.psm == 0x0013) {
-                       connectedBoards.emplace(conn.handle, std::make_unique<BalanceBoard>(bluetooth, conn.handle));
-                       connectedBoards[conn.handle]->setLeds(bluetooth, conn.handle, std::bitset<4>(0b0001));
-                       this->eventListener(BalanceBoardConnected{
-                           .handle = conn.handle,
-                       });
+                   [this, bt](const ACLConnectionEstablished &conn) {
+                     if (conn.psm == 0x0011 && !conn.accepted) {
+                       log_i("HID Control ready; initiating auth and opening HID Interrupt");
+                       bt->auth(conn.handle);
+                       bt->l2cap_connect(conn.handle, 0x0013, 0x40);
+                     } else if (conn.psm == 0x0013) {
+                       if (!connectedBoards.contains(conn.handle)) {
+                         connectedBoards.emplace(conn.handle, std::make_unique<BalanceBoard>(bluetooth, conn.handle));
+                         connectedBoards[conn.handle]->setLeds(bluetooth, conn.handle, std::bitset<4>(0b0001));
+                         this->eventListener(BalanceBoardConnected{
+                             .handle = conn.handle,
+                         });
+                       }
                      }
                    },
                    [this](const ACLData &data) {
@@ -314,5 +335,32 @@ void Wii::onEvent(std::function<void(const WiiEvent &)> eventListener) {
 }
 
 void Wii::disconnect(uint16_t handle, uint16_t psm) { bluetooth->l2cap_disconnect(handle, psm); }
+
+void Wii::set_paired_board(uint64_t bdaddr) {
+  if (!pairedBoard_ || pairedBoard_->bdaddr != bdaddr) {
+    pairedBoard_ = PairedBoard{.bdaddr = bdaddr};
+  }
+}
+
+std::optional<uint64_t> Wii::paired_board() const {
+  if (pairedBoard_) {
+    return pairedBoard_->bdaddr;
+  }
+  return {};
+}
+
+void Wii::set_link_key(uint64_t bdaddr, const uint8_t *linkKeyData) {
+  set_paired_board(bdaddr);
+  pairedBoard_->hasLinkKey = true;
+  memcpy(pairedBoard_->linkKey.data(), linkKeyData, pairedBoard_->linkKey.size());
+}
+
+bool Wii::get_link_key(uint64_t bdaddr, uint8_t *linkKeyData) const {
+  if (!pairedBoard_ || pairedBoard_->bdaddr != bdaddr || !pairedBoard_->hasLinkKey) {
+    return false;
+  }
+  memcpy(linkKeyData, pairedBoard_->linkKey.data(), pairedBoard_->linkKey.size());
+  return true;
+}
 
 }  // namespace esphome::wii_balance_board::detail

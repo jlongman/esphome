@@ -1,7 +1,10 @@
 #pragma once
+
+#include <array>
 #include "bluetooth.h"
 #include <unordered_map>
 #include <memory>
+#include <optional>
 
 namespace esphome::wii_balance_board::detail {
 
@@ -28,8 +31,14 @@ struct ScanStarted {};
 
 struct ScanStopped {};
 
-using WiiEvent =
-    std::variant<BalanceBoardConnected, BalanceBoardDisconnected, BalanceBoardData, ScanStarted, ScanStopped>;
+struct BalanceBoardPaired {
+  uint64_t bdaddr;
+  bool hasLinkKey;
+  uint8_t linkKeyData[16];
+};
+
+using WiiEvent = std::variant<BalanceBoardConnected, BalanceBoardDisconnected, BalanceBoardData, BalanceBoardPaired,
+                              ScanStarted, ScanStopped>;
 
 class Wii {
   struct BalanceBoard;
@@ -48,6 +57,20 @@ class Wii {
   void step();
 
   void disconnect(uint16_t handle, uint16_t psm);
+
+  void set_paired_board(uint64_t bdaddr);
+  std::optional<uint64_t> paired_board() const;
+  void set_link_key(uint64_t bdaddr, const uint8_t *linkKeyData);
+  bool get_link_key(uint64_t bdaddr, uint8_t *linkKeyData) const;
+
+ private:
+  struct PairedBoard {
+    uint64_t bdaddr{0};
+    bool hasLinkKey{false};
+    std::array<uint8_t, 16> linkKey{};
+  };
+
+  std::optional<PairedBoard> pairedBoard_;
 };
 
 }  // namespace esphome::wii_balance_board::detail

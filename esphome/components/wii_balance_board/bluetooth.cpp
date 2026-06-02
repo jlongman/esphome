@@ -11,6 +11,7 @@
 #include "lowlevel_bt.h"
 #include "ring_buffer.h"
 #include <esp_mac.h>
+#include <cstring>
 
 #define CHECK_RESULT(x) \
   if (!x) { \
@@ -33,6 +34,7 @@ struct L2CapConnection {
   uint16_t psm;
   uint16_t remoteCid;
   uint16_t mtu;
+  bool initiator;
 
   bool localConfigured;
   bool remoteConfigured;
@@ -51,7 +53,7 @@ class ConnectionStore {
                             [handle, localCid](const L2CapConnection &connection) {
                               return connection.handle == handle && connection.localCid == localCid;
                             });
-    return &*itr;
+    return itr == l2CapConnections.end() ? nullptr : &*itr;
   }
 
   L2CapConnection *findPsm(uint16_t handle, uint16_t psm) {
@@ -59,7 +61,7 @@ class ConnectionStore {
                             [handle, psm](const L2CapConnection &connection) {
                               return connection.handle == handle && connection.psm == psm;
                             });
-    return &*itr;
+    return itr == l2CapConnections.end() ? nullptr : &*itr;
   }
 
   uint16_t nextCid(uint16_t handle) {
@@ -200,7 +202,9 @@ struct Bluetooth::Impl {
     } else if (data[1] == 0x1A && data[2] == 0x0C) {  // write_scan_enable
       if (data[3] == 0x00) {                          // OK
         initialized = true;
-        readyListener(bluetooth);
+        if (readyListener) {
+          readyListener(bluetooth);
+        }
       } else {
         ESP_LOGE(TAG, "write_scan_enable failed.");
       }
@@ -251,18 +255,26 @@ struct Bluetooth::Impl {
 
   void handleHCIRemoteNameRequestComplete(uint8_t *data, size_t len) {
     uint8_t status = data[0];
-    char *name = (char *) (data + 7);
     uint64_t bdaddr = *(const uint64_t *) (data + 1) & 0xFFFFFFFFFFFFull;
-    auto &inquiry = nameRequests.at(bdaddr);
-    hciListener(bluetooth, HCIRemoteName{.inquiry =
-                                             HCIInquiryResult{
-                                                 .bdaddr = inquiry.bdaddr,
-                                                 .psrm = inquiry.psrm,
-                                                 .classOfDevice = inquiry.classOfDevice,
-                                                 .clkOffset = inquiry.clkOffset,
-                                             },
-                                         .remoteName = {name}});
-    nameRequests.erase(bdaddr);
+    auto itr = nameRequests.find(bdaddr);
+    if (itr == nameRequests.end()) {
+      return;
+    }
+    if (status == 0x00) {
+      char *name = (char *) (data + 7);
+      auto &inquiry = itr->second;
+      hciListener(bluetooth, HCIRemoteName{.inquiry =
+                                               HCIInquiryResult{
+                                                   .bdaddr = inquiry.bdaddr,
+                                                   .psrm = inquiry.psrm,
+                                                   .classOfDevice = inquiry.classOfDevice,
+                                                   .clkOffset = inquiry.clkOffset,
+                                               },
+                                           .remoteName = {name}});
+    } else {
+      ESP_LOGW(TAG, "Remote name request failed for %s status=%02X", formatHex((uint8_t *) &bdaddr, 6), status);
+    }
+    nameRequests.erase(itr);
   }
 
   void handleHCIConnectionComplete(uint8_t *data, size_t len) {
@@ -300,15 +312,22 @@ struct Bluetooth::Impl {
   }
 
   void handleHCILinkKeyRequest(uint8_t *data, size_t len) {
-    uint64_t bdaddr = *(const uint64_t *) (data) &0xFFFFFFFFFFFFull;
-    uint8_t keyType = data[22];
+    uint64_t bdaddr = *(const uint64_t *) (data) & 0xFFFFFFFFFFFFull;
 
-    hciListener(bluetooth, HCILinkKeyRequest{
-                               .bdaddr = bdaddr,
-                               .keyType = keyType,
-                               .linkKeyData = data + 6,
-                               .size = 16,
-                           });
+    hciListener(bluetooth, HCILinkKeyRequest{.bdaddr = bdaddr});
+  }
+
+  void handleHCILinkKeyNotification(uint8_t *data, size_t len) {
+    if (len < 23) {
+      ESP_LOGW(TAG, "Short link key notification");
+      return;
+    }
+
+    uint64_t bdaddr = *(const uint64_t *) (data) & 0xFFFFFFFFFFFFull;
+    HCILinkKeyNotification notification{.bdaddr = bdaddr, .keyType = data[22]};
+    memcpy(notification.linkKeyData, data + 6, sizeof(notification.linkKeyData));
+
+    hciListener(bluetooth, notification);
   }
 
   void handleHCIEvent(uint8_t eventCode, uint8_t *data, size_t len) {
@@ -340,6 +359,9 @@ struct Bluetooth::Impl {
       case 0x17:
         handleHCILinkKeyRequest(data, len);
         break;
+      case 0x18:
+        handleHCILinkKeyNotification(data, len);
+        break;
       case 0x16:
         handleHCIPINRequest(data, len);
         break;
@@ -367,8 +389,6 @@ struct Bluetooth::Impl {
       return;
     }
 
-    uint8_t timeout = 0x10;  // Sync for 20.48 seconds (0x10 * 1.28s)
-
     CHECK_RESULT(enqueue_cmd_inquiry_cancel(txBuffer));
   }
 
@@ -380,6 +400,10 @@ struct Bluetooth::Impl {
   void sendHCIConnect(const HCIInquiryResult &result) {
     connectRequests.emplace(result.bdaddr);
     CHECK_RESULT(enqueue_cmd_create_connection(txBuffer, result.bdaddr, 0x0008, result.psrm, result.clkOffset, 0x00));
+  }
+
+  void sendHCILinkKeyReply(uint64_t bdaddr, const uint8_t *linkKeyData) {
+    CHECK_RESULT(enqueue_cmd_link_key_reply(txBuffer, bdaddr, linkKeyData));
   }
 
   void sendHCINegativeReply(uint64_t bdaddr) { CHECK_RESULT(enqueue_cmd_negative_reply(txBuffer, bdaddr)); }
@@ -450,6 +474,7 @@ struct Bluetooth::Impl {
                                    .handle = handle,
                                    .sourceCid = sourceCid,
                                    .psm = connection->psm,
+                                   .accepted = !connection->initiator,
                                });
       }
     }
@@ -516,13 +541,18 @@ struct Bluetooth::Impl {
   void handleL2ConfigurationResponse(uint16_t handle, uint8_t *data) {
     uint16_t sourceCid = (data[5] << 8) | data[4];
     auto *connection = connections.findLocal(handle, sourceCid);
+    if (connection == nullptr) {
+      ESP_LOGW(TAG, "Received unexpected L2Cap Configuration response, ignoring");
+      return;
+    }
 
     connection->localConfigured = true;
-    if (connection && connection->localConfigured && connection->remoteConfigured) {
+    if (connection->localConfigured && connection->remoteConfigured) {
       aclListener(bluetooth, ACLConnectionEstablished{
                                  .handle = handle,
                                  .sourceCid = sourceCid,
                                  .psm = connection->psm,
+                                 .accepted = !connection->initiator,
                              });
     }
   }
@@ -552,6 +582,7 @@ struct Bluetooth::Impl {
           .psm = psm,
           .remoteCid = sourceCid,
           .mtu = 0x00B9,
+          .initiator = false,
           .localConfigured = false,
           .remoteConfigured = false,
       });
@@ -647,6 +678,7 @@ struct Bluetooth::Impl {
         .psm = psm,
         .remoteCid = 0,
         .mtu = mtu,
+        .initiator = true,
         .localConfigured = false,
         .remoteConfigured = false,
     });
@@ -720,7 +752,12 @@ Bluetooth::Bluetooth() : m_impl(std::make_unique<Bluetooth::Impl>(this)) {
 
 Bluetooth::~Bluetooth() { ESP_LOGD(TAG, "Shut down"); }
 
-void Bluetooth::onReady(const std::function<void(Bluetooth *)> &listener) { m_impl->readyListener = listener; }
+void Bluetooth::onReady(const std::function<void(Bluetooth *)> &listener) {
+  m_impl->readyListener = listener;
+  if (m_impl->initialized && m_impl->readyListener) {
+    m_impl->readyListener(this);
+  }
+}
 
 void Bluetooth::process() { m_impl->step(); }
 
@@ -755,6 +792,10 @@ void Bluetooth::onACLEvent(const std::function<void(Bluetooth *, const ACLEvent 
 }
 
 void Bluetooth::auth(uint16_t handle) { m_impl->sendHCIAuth(handle); }
+
+void Bluetooth::sendLinkKeyReply(uint64_t bdaddr, const uint8_t *linkKeyData) {
+  m_impl->sendHCILinkKeyReply(bdaddr, linkKeyData);
+}
 
 void Bluetooth::negativeReply(uint64_t bdaddr) { m_impl->sendHCINegativeReply(bdaddr); }
 
