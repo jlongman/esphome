@@ -12,6 +12,7 @@
 #include "ring_buffer.h"
 #include <esp_mac.h>
 #include <cstring>
+#include <optional>
 
 #define CHECK_RESULT(x) \
   if (!x) { \
@@ -155,6 +156,9 @@ struct Bluetooth::Impl {
   ConnectionStore connections;
   bool started{false};
   bool initialized{false};
+  bool inquiryActive{false};
+  bool inquiryCancelPending{false};
+  std::optional<HCIInquiryResult> pendingConnect;
   std::unordered_set<uint64_t> discovered;
   std::unordered_set<uint64_t> connectRequests;
   std::unordered_map<uint64_t, HCIInquiryResult> nameRequests;
@@ -216,6 +220,29 @@ struct Bluetooth::Impl {
     }
   }
 
+  void enqueueHCIConnect(const HCIInquiryResult &result) {
+    ESP_LOGD(TAG, "Queueing HCI create connection for %s", formatHex((uint8_t *) &result.bdaddr, 6));
+    connectRequests.emplace(result.bdaddr);
+    CHECK_RESULT(enqueue_cmd_create_connection(txBuffer, result.bdaddr, 0x0008, result.psrm, result.clkOffset, 0x00));
+  }
+
+  void finishInquiry() {
+    bool wasInquiryActive = inquiryActive || inquiryCancelPending;
+    inquiryActive = false;
+    inquiryCancelPending = false;
+    discovered.clear();
+
+    if (wasInquiryActive && hciListener) {
+      hciListener(bluetooth, HCIInquiryComplete{});
+    }
+
+    if (pendingConnect) {
+      auto result = *pendingConnect;
+      pendingConnect.reset();
+      enqueueHCIConnect(result);
+    }
+  }
+
   // HCI
   void handleHCICommandComplete(uint8_t *data, size_t len) {
     if (len < 4) {
@@ -225,7 +252,15 @@ struct Bluetooth::Impl {
     ESP_LOGD(TAG, "HCI command complete opcode=0x%02X%02X status=0x%02X len=%u", data[2], data[1], data[3],
              (unsigned) len);
 
-    if (data[1] == 0x03 && data[2] == 0x0C) {  // reset
+    if (data[1] == 0x02 && data[2] == 0x04) {  // inquiry_cancel
+      if (data[3] == 0x00) {
+        ESP_LOGD(TAG, "Inquiry cancel complete");
+        finishInquiry();
+      } else {
+        ESP_LOGW(TAG, "Inquiry cancel failed status=%02X", data[3]);
+        inquiryCancelPending = false;
+      }
+    } else if (data[1] == 0x03 && data[2] == 0x0C) {  // reset
       if (data[3] == 0x00) {
         ESP_LOGD(TAG, "HCI reset complete; reading Bluetooth address");
         CHECK_RESULT(enqueue_cmd_read_bd_addr(txBuffer));
@@ -275,6 +310,8 @@ struct Bluetooth::Impl {
     }
     if (len >= 4 && data[2] == 0x01 && data[3] == 0x04) {
       if (data[0] == 0x00) {
+        inquiryActive = true;
+        inquiryCancelPending = false;
         hciListener(bluetooth, HCIInquiryStarted{});
       } else {
         log_e("Failed to start inquiry, error=%02X", data[0]);
@@ -300,10 +337,7 @@ struct Bluetooth::Impl {
     }
   }
 
-  void handleHCIInqueryComplete(uint8_t *data, size_t len) {
-    hciListener(bluetooth, HCIInquiryComplete{});
-    discovered.clear();
-  }
+  void handleHCIInqueryComplete(uint8_t *data, size_t len) { finishInquiry(); }
 
   void handleHCIDisconnect(uint8_t *data, size_t len) {
     uint8_t status = data[0];
@@ -455,6 +489,7 @@ struct Bluetooth::Impl {
     }
 
     ESP_LOGD(TAG, "Queueing HCI inquiry cancel");
+    inquiryCancelPending = true;
     CHECK_RESULT(enqueue_cmd_inquiry_cancel(txBuffer));
   }
 
@@ -464,8 +499,16 @@ struct Bluetooth::Impl {
   }
 
   void sendHCIConnect(const HCIInquiryResult &result) {
-    connectRequests.emplace(result.bdaddr);
-    CHECK_RESULT(enqueue_cmd_create_connection(txBuffer, result.bdaddr, 0x0008, result.psrm, result.clkOffset, 0x00));
+    if (inquiryActive || inquiryCancelPending) {
+      ESP_LOGD(TAG, "Deferring HCI create connection until inquiry stops");
+      pendingConnect = result;
+      if (inquiryActive && !inquiryCancelPending) {
+        sendHCIScanCancel();
+      }
+      return;
+    }
+
+    enqueueHCIConnect(result);
   }
 
   void sendHCILinkKeyReply(uint64_t bdaddr, const uint8_t *linkKeyData) {
