@@ -163,6 +163,7 @@ void WiiBalanceBoard::setup() {
       this->sync(true);
     }
   });
+  bluetooth.begin();
 
   wii.onEvent([this](const detail::WiiEvent &event) {
     std::visit(overloaded{

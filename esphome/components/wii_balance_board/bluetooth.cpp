@@ -110,6 +110,7 @@ struct Bluetooth::Impl {
   RingBuffer rxBuffer;
   RingBuffer txBuffer;
   ConnectionStore connections;
+  bool started{false};
   bool initialized{false};
   std::unordered_set<uint64_t> discovered;
   std::unordered_set<uint64_t> connectRequests;
@@ -730,9 +731,21 @@ static int recv(uint8_t *data, uint16_t len) { return gListener(data, len); }
 
 static const esp_vhci_host_callback_t callback = {sendReady, recv};
 
-Bluetooth::Bluetooth() : m_impl(std::make_unique<Bluetooth::Impl>(this)) {
+Bluetooth::Bluetooth() : m_impl(std::make_unique<Bluetooth::Impl>(this)) {}
+
+Bluetooth::~Bluetooth() { ESP_LOGD(TAG, "Shut down"); }
+
+void Bluetooth::begin() {
+  if (m_impl->started) {
+    if (m_impl->initialized && m_impl->readyListener) {
+      m_impl->readyListener(this);
+    }
+    return;
+  }
+
+  ESP_LOGI(TAG, "Starting Bluetooth controller");
   if (!btStart()) {
-    ESP_LOGE(TAG, "Failed to initialize Bluetooth");
+    ESP_LOGE(TAG, "Failed to initialize Bluetooth controller");
     return;
   }
 
@@ -746,11 +759,15 @@ Bluetooth::Bluetooth() : m_impl(std::make_unique<Bluetooth::Impl>(this)) {
     return ESP_OK;
   };
 
-  esp_vhci_host_register_callback(&callback);
+  esp_err_t err = esp_vhci_host_register_callback(&callback);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_vhci_host_register_callback failed: %s", esp_err_to_name(err));
+    return;
+  }
+
+  m_impl->started = true;
   m_impl->sendHCIReset();
 }
-
-Bluetooth::~Bluetooth() { ESP_LOGD(TAG, "Shut down"); }
 
 void Bluetooth::onReady(const std::function<void(Bluetooth *)> &listener) {
   m_impl->readyListener = listener;
@@ -759,7 +776,12 @@ void Bluetooth::onReady(const std::function<void(Bluetooth *)> &listener) {
   }
 }
 
-void Bluetooth::process() { m_impl->step(); }
+void Bluetooth::process() {
+  if (!m_impl->started) {
+    return;
+  }
+  m_impl->step();
+}
 
 // HCI
 void Bluetooth::onHCIEvent(const std::function<void(Bluetooth *, const HCIEvent &)> &listener) {
